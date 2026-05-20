@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <memory>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -9,7 +10,7 @@
 #include <string>
 #include "base.hpp"
 
-// Utility functions for monitoring process memory
+// Read /proc/self/maps and return count of lines mentioning needle.
 static int count_mappings(const std::string & needle) {
   FILE * f = fopen("/proc/self/maps", "r");
   if (!f) return -1;
@@ -22,6 +23,7 @@ static int count_mappings(const std::string & needle) {
   return n;
 }
 
+// Reliable readability check via pipe syscall
 static bool address_is_readable(const void * p) {
   int fds[2];
   if (pipe(fds) < 0) return false;
@@ -34,79 +36,57 @@ static bool address_is_readable(const void * p) {
   return false;
 }
 
-// RAII Library Manager (No RTLD_NODELETE)
-struct LibraryHandle {
-  void * handle;
-  std::string name;
-
-  LibraryHandle(const std::string & path, const std::string & basename) : name(basename) {
-    // Normal LAZY load. The memory WILL unmap when dlclose is called.
-    handle = dlopen(path.c_str(), RTLD_LAZY);
-    printf("  [LibraryHandle] dlopen executed for %s\n", name.c_str());
-  }
-
-  ~LibraryHandle() {
-    if (handle) {
-      dlclose(handle);
-      printf("  [LibraryHandle] dlclose executed. Memory safely unmapped!\n");
-    }
-  }
-};
-
 int main(int argc, char ** argv) {
-  if (argc < 2) { fprintf(stderr, "usage: %s <path-to-plugin.so>\n", argv[0]); return 2; }
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s <path-to-plugin.so> [--nodelete]\n", argv[0]);
+    return 2;
+  }
   std::string path = argv[1];
   std::string basename = path.substr(path.find_last_of("/") + 1);
 
-  // Loop 2 times to check for static state accumulation across reloads
-  for (int cycle = 1; cycle <= 2; ++cycle) {
-    printf("\n============================================\n");
-    printf("== CYCLE %d: Loading %s ==\n", cycle, basename.c_str());
-    printf("============================================\n");
-
-    std::vector<std::weak_ptr<Base>> weaks;
-    void * vtable_addr = nullptr;
-
-    // 1. Load the library via our smart manager
-    auto lib_lifetime = std::make_shared<LibraryHandle>(path, basename);
-    if (!lib_lifetime->handle) { fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 1; }
-
-    auto make = (std::shared_ptr<Base>(*)())dlsym(lib_lifetime->handle, "make_obj");
-    if (!make) { fprintf(stderr, "dlsym failed: %s\n", dlerror()); return 1; }
-
-    {
-      // 2. Fetch the plugin object
-      std::shared_ptr<Base> plugin_obj = make();
-      Base * raw = plugin_obj.get();
-      vtable_addr = *(void **) raw;
-
-      // 3. Keep the library alive via the custom deleter
-      std::shared_ptr<Base> managed_obj(raw, [lib_lifetime, plugin_obj](Base* p) {
-        // Keeps lib_lifetime reference count extended until the object finishes deleting
-      });
-
-      printf("  Mappings while strong ref held: %d\n", count_mappings(basename));
-      printf("  Derived vtable @ %p, readable: %s\n",
-             vtable_addr, address_is_readable(vtable_addr) ? "yes" : "NO");
-
-      weaks.push_back(managed_obj);
-    }
-    // Strong ref dropped. C++ object deleted. Only weak_ptr context block remains.
-
-    printf("\n  -- Simulating Host dropping its main library handle --\n");
-    lib_lifetime.reset();
-
-    printf("  Mappings after host reset:        %d (Stalled from unmapping by weak_ptr)\n", count_mappings(basename));
-    printf("  Vtable still readable:            %s\n", address_is_readable(vtable_addr) ? "yes" : "NO");
-
-    printf("\n  -- Destroying remaining weak_ptr trackers --\n");
-    fflush(stdout);
-
-    weaks.clear(); // Control block dies -> Custom deleter dies -> LibraryHandle ref count hits 0 -> dlclose() fires!
-
-    printf("  Mappings post-cleanup:            %d (Successfully dropped to 0!)\n", count_mappings(basename));
-    printf("  Survived cycle %d without fault.\n", cycle);
+  // Determine flag configuration based on command-line arguments
+  int flags = RTLD_LAZY;
+  if (argc >= 3 && std::string(argv[2]) == "--nodelete") {
+    flags |= RTLD_NODELETE;
+    printf("== Loading %s WITH RTLD_NODELETE (Workaround Mode) ==\n", basename.c_str());
+  } else {
+    printf("== Loading %s WITHOUT RTLD_NODELETE (Bug Exposure Mode) ==\n", basename.c_str());
   }
 
+  void * h = dlopen(path.c_str(), flags);
+  if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+
+  auto make = (std::shared_ptr<Base>(*)())dlsym(h, "make_obj");
+  if (!make) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+
+  std::vector<std::weak_ptr<Base>> weaks;
+  void * vtable_addr = nullptr;
+  {
+    std::shared_ptr<Base> p = make();
+    Base * raw = p.get();
+    vtable_addr = *(void **) raw;     // vtable pointer at offset 0 of the object
+    printf("  mappings while strong ref held: %d\n", count_mappings(basename));
+    printf("  Derived vtable @ %p, readable: %s\n",
+           vtable_addr, address_is_readable(vtable_addr) ? "yes" : "NO");
+    weaks.push_back(p);
+  }
+  // Strong ref dropped. Object destroyed. weak_count = 1.
+
+  printf("\n== Strong ref dropped; weak_ptr alive. Calling dlclose() ==\n");
+  int rc = dlclose(h);
+  printf("  dlclose returned: %d (refcount drop succeeded)\n", rc);
+
+  int after = count_mappings(basename);
+  bool readable = address_is_readable(vtable_addr);
+  printf("  mappings after dlclose:           %d\n", after);
+  printf("  vtable still readable:            %s\n", readable ? "yes" : "NO");
+
+  printf("\n== Destroying weak_ptr (calls _M_destroy via vtable lookup) ==\n");
+  fflush(stdout);
+
+  // Clang will crash here without --nodelete (provided unique symbols are stripped/absent)
+  weaks.clear();
+
+  printf("  Survived. No fault.\n");
   return 0;
 }
